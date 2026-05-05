@@ -1,0 +1,618 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["iterm2"]
+# ///
+"""termctl: wrap iTerm2's Python API to split panes and run commands."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Optional, TextIO
+
+EXIT_OK, EXIT_USAGE, EXIT_ITERM, EXIT_SPLIT, EXIT_FILE = 0, 2, 3, 4, 5
+KNOWN_SUBCOMMANDS = {"exec", "prompt"}
+TERMCTL_DIR = Path.home() / ".termctl"
+PRESETS_DIR = TERMCTL_DIR / "presets"
+PROMPT_PATH = TERMCTL_DIR / "prompt.md"
+
+DEFAULT_PROMPT_MD = """\
+# termctl agent prompt
+
+You will receive a user request. Convert it into a list of shell commands to
+run in parallel iTerm2 panes.
+
+## Output rules (strict)
+
+- Output ONLY shell commands, one per line.
+- No markdown fences. Do not wrap output in ``` blocks.
+- No preamble, no numbering, no prose, no explanation.
+- Lines starting with `#` are treated as comments by the consumer; use them
+  sparingly to annotate sections if helpful.
+- Blank lines are allowed and are ignored.
+
+## Behavior
+
+- Each command runs in its own iTerm2 pane.
+- Each pane is expected to stay open and stream output. Prefer follow-style
+  commands (e.g. `tail -f`, `stern`, watchers, `top`, `k9s`) over one-shot
+  commands that exit immediately, unless the user explicitly asked for a
+  one-shot.
+- You may use whatever tools are available to you (kubectl, gh, ripgrep,
+  etc.) to research the right commands. The user only sees the final list of
+  commands you emit.
+- If the request is ambiguous, make a reasonable choice and proceed rather
+  than asking for clarification.
+"""
+
+
+class TermctlError(Exception):
+    """Base for termctl failures; carries a target exit code."""
+
+    code = EXIT_ITERM
+
+
+class UsageError(TermctlError):
+    """User-facing argument or input error."""
+
+    code = EXIT_USAGE
+
+
+class FileError(TermctlError):
+    """--file path missing or unreadable."""
+
+    code = EXIT_FILE
+
+
+class ITermError(TermctlError):
+    """iTerm2 unreachable, API disabled, or no window/tab/session."""
+
+    code = EXIT_ITERM
+
+
+class SplitError(TermctlError):
+    """A pane split or send_text call failed."""
+
+    code = EXIT_SPLIT
+
+
+class Logger:
+    """Diagnostic output stream controlled by --log-output."""
+
+    def __init__(self, stream: Optional[TextIO], owns: bool) -> None:
+        """Hold the destination stream (or None for silent) plus ownership flag."""
+        self.stream, self.owns = stream, owns
+
+    def log(self, message: str) -> None:
+        """Write a line to the configured destination, if any."""
+        if self.stream is None:
+            return
+        self.stream.write(message.rstrip("\n") + "\n")
+        self.stream.flush()
+
+    def error(self, message: str) -> None:
+        """Write an error line. Falls back to stderr when logging is silent."""
+        target = self.stream if self.stream is not None else sys.stderr
+        target.write(message.rstrip("\n") + "\n")
+        target.flush()
+
+    def close(self) -> None:
+        """Close the underlying stream if we opened it."""
+        if self.owns and self.stream is not None:
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+
+
+def build_logger(dest: str) -> Logger:
+    """Create a Logger for the given --log-output value."""
+    if dest == "std":
+        return Logger(sys.stdout, owns=False)
+    if dest == "stderr":
+        return Logger(sys.stderr, owns=False)
+    if dest == "":
+        return Logger(None, owns=False)
+    path = Path(dest).expanduser()
+    try:
+        return Logger(open(path, "a", buffering=1, encoding="utf-8"), owns=True)
+    except OSError as exc:
+        raise FileError(f"cannot open log file {path}: {exc}") from exc
+
+
+@dataclass
+class ExecPlan:
+    """Parsed exec invocation ready to drive iTerm2."""
+
+    commands: list[str]
+    split: str
+    new_tab: bool
+    dry_run: bool
+
+
+def split_on_delimiter(args: list[str], delimiter: str) -> list[str]:
+    """Split argv tail on the literal delimiter into shell-quoted command strings."""
+    groups: list[list[str]] = [[]]
+    for token in args:
+        if token == delimiter:
+            groups.append([])
+        else:
+            groups[-1].append(token)
+    if groups and not groups[0]:
+        groups = groups[1:]
+    if not groups:
+        raise UsageError("no commands provided")
+    for group in groups:
+        if not group:
+            raise UsageError(f"empty command group between '{delimiter}' delimiters")
+    return [" ".join(shlex.quote(t) for t in g) for g in groups]
+
+
+def resolve_file_path(path_str: str) -> Path:
+    """Resolve --file: try the explicit path, then ~/.termctl/presets/<basename>."""
+    explicit = Path(path_str).expanduser()
+    if explicit.is_file():
+        return explicit
+    try:
+        PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise FileError(f"cannot create presets dir {PRESETS_DIR}: {exc}") from exc
+    fallback = PRESETS_DIR / Path(path_str).name
+    if fallback.is_file():
+        return fallback
+    raise FileError(f"file not found: tried {explicit} and {fallback}")
+
+
+def read_commands_file(path_str: str) -> list[str]:
+    """Read commands from a file (or stdin when path is '-'), one per line."""
+    if path_str == "-":
+        if sys.stdin.isatty():
+            raise UsageError("--file - requires piped stdin")
+        text, source = sys.stdin.read(), "<stdin>"
+    else:
+        path = resolve_file_path(path_str)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise FileError(f"cannot read {path}: {exc}") from exc
+        source = str(path)
+    commands: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            shlex.split(line)
+        except ValueError as exc:
+            raise UsageError(f"invalid quoting in {source}: {line!r} ({exc})") from exc
+        commands.append(line)
+    if not commands:
+        raise UsageError(f"no commands found in {source}")
+    return commands
+
+
+def make_exec_parser(prog: str) -> argparse.ArgumentParser:
+    """Build the argparse parser for the exec subcommand."""
+    parser = argparse.ArgumentParser(
+        prog=f"{prog} exec",
+        description="Split the current iTerm2 tab into N panes and run a command in each.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Log destinations for --log-output:\n"
+            "  std     write diagnostics to stdout (default)\n"
+            "  stderr  write diagnostics to stderr\n"
+            "  ''      empty string disables diagnostic output entirely\n"
+            "  PATH    any other value is treated as a file path (appended to)\n"
+            "\n"
+            "--file lookup:\n"
+            "  the path is tried as given first, then ~/.termctl/presets/<basename>\n"
+            "  the presets dir is created automatically if missing\n"
+            "\n"
+            "Examples:\n"
+            "  termctl --split vertical -- top -- htop\n"
+            "  termctl exec -- stern -n prod api -- stern -n prod worker\n"
+            "  cat commands.txt | termctl exec --file -\n"
+            "  termctl exec --file my-preset    # resolves to ~/.termctl/presets/my-preset\n"
+            "  cat file-foo.txt | termctl --file - -- stern -n hello hello\n"
+            "      # file lines first, then inline commands, all in one run\n"
+            "  termctl exec --dry-run -- echo a -- echo b\n"
+        ),
+    )
+    parser.add_argument("--split", choices=["horizontal", "vertical"], default="vertical",
+                        help="pane orientation; vertical is side-by-side (default), horizontal stacks top-to-bottom")
+    parser.add_argument("--delimiter", default="--", help="separator between inline commands (default: --)")
+    parser.add_argument("--file", dest="file", default=None,
+                        help="read commands from a file, one per line; '-' reads from stdin. "
+                             "Can be combined with inline commands; file lines come first")
+    parser.add_argument("--log-output", dest="log_output", default="std",
+                        help="diagnostic output destination: std, stderr, '' (silent), or a file path")
+    parser.add_argument("--dry-run", action="store_true", help="print the parsed plan and exit without touching iTerm2")
+    parser.add_argument("--new-tab", action="store_true", help="open a new tab instead of splitting the current one")
+    parser.add_argument("--debug", action="store_true", help="show Python tracebacks on errors")
+    parser.add_argument("rest", nargs=argparse.REMAINDER,
+                        help="commands separated by the delimiter (e.g. -- cmd1 -- cmd2)")
+    return parser
+
+
+def parse_exec(prog: str, argv: list[str]) -> tuple[ExecPlan, Logger, bool]:
+    """Parse exec args into a plan, plus its logger and the debug flag."""
+    ns = make_exec_parser(prog).parse_args(argv)
+    logger = build_logger(ns.log_output)
+    has_inline, has_file = bool(ns.rest), ns.file is not None
+    if not has_inline and not has_file:
+        raise UsageError("provide commands inline (e.g. -- cmd1 -- cmd2), via --file, or both")
+    commands: list[str] = []
+    if has_file:
+        commands.extend(read_commands_file(ns.file))
+    if has_inline:
+        rest = ns.rest[1:] if ns.rest and ns.rest[0] == "--" else ns.rest
+        commands.extend(split_on_delimiter(rest, ns.delimiter))
+    return ExecPlan(commands, ns.split, ns.new_tab, ns.dry_run), logger, ns.debug
+
+
+async def run_exec_in_iterm(plan: ExecPlan, logger: Logger, connection) -> None:
+    """Drive iTerm2 to materialise the plan: open/split panes and send commands."""
+    import iterm2
+
+    app = await iterm2.async_get_app(connection)
+    window = app.current_terminal_window if app else None
+    if window is None:
+        raise ITermError("iTerm2 is not running or has no open window")
+    tab = await window.async_create_tab() if plan.new_tab else window.current_tab
+    if tab is None:
+        raise ITermError("iTerm2 has no active tab")
+    root = tab.current_session
+    if root is None:
+        raise ITermError("iTerm2 has no active session in the current tab")
+    vertical_divider = plan.split == "vertical"
+    sessions = [root]
+    for index in range(1, len(plan.commands)):
+        try:
+            sessions.append(await sessions[-1].async_split_pane(vertical=vertical_divider))
+        except Exception as exc:
+            raise SplitError(f"failed to create pane {index + 1} of {len(plan.commands)}: {exc}") from exc
+    for session, command in zip(sessions, plan.commands):
+        try:
+            await session.async_set_name(command)
+        except Exception:
+            pass
+        try:
+            await session.async_send_text(command + "\n")
+        except Exception as exc:
+            raise SplitError(f"failed to send command to pane: {exc}") from exc
+    logger.log(f"termctl: launched {len(plan.commands)} pane(s)")
+
+
+def render_plan(plan: ExecPlan) -> str:
+    """Format an ExecPlan for --dry-run output."""
+    head = [f"panes: {len(plan.commands)}", f"orientation: {plan.split}", f"new_tab: {plan.new_tab}"]
+    body = [f"  [{i}] {c}" for i, c in enumerate(plan.commands, 1)]
+    return "\n".join(head + body)
+
+
+def cmd_exec(prog: str, argv: list[str]) -> int:
+    """Handler for the exec subcommand."""
+    logger: Optional[Logger] = None
+    debug = False
+    try:
+        plan, logger, debug = parse_exec(prog, argv)
+        if plan.dry_run:
+            logger.log("termctl: dry run\n" + render_plan(plan))
+            return EXIT_OK
+        try:
+            import iterm2
+        except ImportError as exc:
+            raise ITermError(f"iterm2 package not available: {exc}") from exc
+        try:
+            iterm2.run_until_complete(lambda c: run_exec_in_iterm(plan, logger, c))
+        except TermctlError:
+            raise
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "api" in msg and any(k in msg for k in ("enable", "permission", "not enabled")):
+                raise ITermError(
+                    "iTerm2 Python API is not enabled. Enable it in iTerm2 -> Settings -> "
+                    "General -> Magic -> Enable Python API, then approve the script on first run."
+                ) from exc
+            raise ITermError(f"could not connect to iTerm2: {exc}") from exc
+        return EXIT_OK
+    except TermctlError as exc:
+        prefix = "termctl: usage: " if isinstance(exc, UsageError) else "termctl: "
+        (logger or Logger(sys.stderr, False)).error(prefix + str(exc))
+        if debug:
+            traceback.print_exc(file=sys.stderr)
+        return exc.code
+    except SystemExit:
+        raise
+    except Exception as exc:
+        (logger or Logger(sys.stderr, False)).error(f"termctl: unexpected error: {exc}")
+        if debug:
+            traceback.print_exc(file=sys.stderr)
+        return EXIT_ITERM
+    finally:
+        if logger is not None:
+            logger.close()
+
+
+def supports_color(stream: TextIO) -> bool:
+    """Return True if stream is a TTY and the environment doesn't suppress color."""
+    return (
+        hasattr(stream, "isatty")
+        and stream.isatty()
+        and os.environ.get("NO_COLOR") is None
+        and os.environ.get("TERM") != "dumb"
+    )
+
+
+def clean_agent_output(text: str) -> str:
+    """Strip markdown code fences and surrounding blank lines. Conservative."""
+    fence = re.compile(r"^\s*(```|~~~)")
+    kept = [ln for ln in text.splitlines() if not fence.match(ln)]
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return ("\n".join(kept) + "\n") if kept else ""
+
+
+def cmd_prompt_context(prog: str, argv: list[str]) -> int:
+    """Print the agent prompt template; create ~/.termctl/prompt.md on first run."""
+    parser = argparse.ArgumentParser(
+        prog=f"{prog} prompt context",
+        description="Print the agent prompt template. Creates ~/.termctl/prompt.md on first run.",
+    )
+    parser.add_argument("--regenerate", action="store_true",
+                        help="overwrite the existing prompt file with the built-in default")
+    ns = parser.parse_args(argv)
+    try:
+        TERMCTL_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        sys.stderr.write(f"termctl: cannot create {TERMCTL_DIR}: {exc}\n")
+        return EXIT_FILE
+    if ns.regenerate or not PROMPT_PATH.is_file():
+        try:
+            PROMPT_PATH.write_text(DEFAULT_PROMPT_MD, encoding="utf-8")
+        except OSError as exc:
+            sys.stderr.write(f"termctl: cannot write {PROMPT_PATH}: {exc}\n")
+            return EXIT_FILE
+    try:
+        sys.stdout.write(PROMPT_PATH.read_text(encoding="utf-8"))
+    except OSError as exc:
+        sys.stderr.write(f"termctl: cannot read {PROMPT_PATH}: {exc}\n")
+        return EXIT_FILE
+    return EXIT_OK
+
+
+def preset_filename(now: datetime) -> str:
+    """Build the base filename (no suffix) for a preset saved at `now` in local time."""
+    return f"llm_{now.day}:{now.month}:{now.year}_{now.hour:02d}:{now.minute:02d}"
+
+
+def unique_preset_path(base: str) -> Path:
+    """Return a non-existing path under PRESETS_DIR, appending a random short suffix on collision."""
+    path = PRESETS_DIR / f"{base}.txt"
+    while path.exists():
+        suffix = secrets.token_hex(2)[:3]
+        path = PRESETS_DIR / f"{base}_{suffix}.txt"
+    return path
+
+
+def print_accept_summary(cleaned: str, path: Path) -> None:
+    """Write the cleaned content plus a colored saved-to / run-with footer to stdout."""
+    color = supports_color(sys.stdout)
+    bold = "\033[1m" if color else ""
+    cyan = "\033[36m" if color else ""
+    green = "\033[32m" if color else ""
+    dim = "\033[2m" if color else ""
+    reset = "\033[0m" if color else ""
+    rule = f"{dim}{'-' * 40}{reset}\n"
+    sys.stdout.write(rule)
+    sys.stdout.write(cleaned)
+    if not cleaned.endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stdout.write(rule)
+    sys.stdout.write(f"{bold}saved to:{reset} {cyan}{path}{reset}\n")
+    sys.stdout.write(f"{bold}run with:{reset} {green}cat {shlex.quote(str(path))} | termctl --file -{reset}\n")
+    sys.stdout.flush()
+
+
+def cmd_prompt_accept(prog: str, argv: list[str]) -> int:
+    """Read agent output from stdin, clean it, save under ~/.termctl/presets/."""
+    parser = argparse.ArgumentParser(
+        prog=f"{prog} prompt accept",
+        description="Read agent output from stdin, strip code fences, save to ~/.termctl/presets/.",
+    )
+    parser.parse_args(argv)
+    if sys.stdin.isatty():
+        sys.stderr.write("termctl: prompt accept reads from stdin; nothing was piped\n")
+        return EXIT_USAGE
+    cleaned = clean_agent_output(sys.stdin.read())
+    if not cleaned.strip():
+        sys.stderr.write("termctl: agent produced no commands after cleaning\n")
+        return EXIT_USAGE
+    try:
+        PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        sys.stderr.write(f"termctl: cannot create {PRESETS_DIR}: {exc}\n")
+        return EXIT_FILE
+    path = unique_preset_path(preset_filename(datetime.now()))
+    try:
+        path.write_text(cleaned, encoding="utf-8")
+    except OSError as exc:
+        sys.stderr.write(f"termctl: cannot write {path}: {exc}\n")
+        return EXIT_FILE
+    print_accept_summary(cleaned, path)
+    return EXIT_OK
+
+
+def print_prompt_help(prog: str) -> None:
+    """Print help for the `prompt` subcommand group."""
+    sys.stdout.write(
+        f"usage: {prog} prompt {{context,accept,claude}} [options]\n\n"
+        f"Subcommands:\n"
+        f"  context  print the agent prompt (creates ~/.termctl/prompt.md on first run)\n"
+        f"           --regenerate overwrites the file with the built-in default\n"
+        f"  accept   read agent output from stdin, strip code fences, save to\n"
+        f"           ~/.termctl/presets/llm_<D>:<M>:<Y>_<HH>:<MM>.txt (local time)\n"
+        f"  claude   build the full context|claude|accept pipeline as one line,\n"
+        f"           copy it to your clipboard, and print it (does not execute)\n"
+        f"\n"
+        f"Full pipeline (context -> agent -> accept -> exec):\n"
+        f"\n"
+        f"{prog} prompt context \\\n"
+        f"  | claude -p \"watch CPU, memory, and disk activity\" \\\n"
+        f"      --output-format text \\\n"
+        f"      --dangerously-skip-permissions \\\n"
+        f"  | {prog} prompt accept\n"
+        f"\n"
+        f"Or have it built for you, copied to clipboard, and printed:\n"
+        f"\n"
+        f"{prog} prompt claude \"watch CPU, memory, and disk activity\" -- --model sonnet\n"
+        f"\n"
+        f"`accept` prints the cleaned commands plus a footer like:\n"
+        f"\n"
+        f"saved to: ~/.termctl/presets/llm_5:5:2026_14:00.txt\n"
+        f"run with: cat ~/.termctl/presets/llm_5:5:2026_14:00.txt | {prog} --file -\n"
+        f"\n"
+        f"Run that final line (or `{prog} --file llm_5:5:2026_14:00.txt`) to launch\n"
+        f"the panes. `--dangerously-skip-permissions` is required because the\n"
+        f"pipeline is non-interactive (no TTY for the agent to prompt on).\n"
+        f"\n"
+        f"Run '{prog} prompt <sub> --help' for flags on a specific subcommand.\n"
+    )
+
+
+DEFAULT_CLAUDE_QUERY = "watch CPU, memory, and disk activity"
+
+
+def cmd_prompt_claude(prog: str, argv: list[str]) -> int:
+    """Build the full context | claude | accept pipeline; copy to clipboard and print."""
+    if argv and argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(
+            f"usage: {prog} prompt claude [QUERY...] [-- claude_args...]\n\n"
+            f"Builds the full pipeline as a single line:\n"
+            f"\n"
+            f"  {prog} prompt context | claude -p 'QUERY' --output-format text \\\n"
+            f"      --dangerously-skip-permissions [extra...] | {prog} prompt accept\n"
+            f"\n"
+            f"The constructed command is copied to your clipboard (via pbcopy) and\n"
+            f"printed to stdout. Nothing is executed; paste it into your terminal\n"
+            f"to run it.\n"
+            f"\n"
+            f"  QUERY      free-form prompt for the agent. Joined with spaces if\n"
+            f"             passed unquoted. Defaults to '{DEFAULT_CLAUDE_QUERY}'.\n"
+            f"  -- ARGS    everything after `--` is appended verbatim to the\n"
+            f"             claude invocation, e.g. `-- --model sonnet`.\n"
+            f"\n"
+            f"Examples:\n"
+            f"  {prog} prompt claude\n"
+            f"  {prog} prompt claude \"tail logs from api, worker, scheduler\"\n"
+            f"  {prog} prompt claude -- --model sonnet\n"
+            f"  {prog} prompt claude \"watch disk and net\" -- --model sonnet\n"
+        )
+        return EXIT_OK
+
+    if "--" in argv:
+        idx = argv.index("--")
+        left, extra = argv[:idx], argv[idx + 1:]
+    else:
+        left, extra = argv, []
+    query = " ".join(left).strip() or DEFAULT_CLAUDE_QUERY
+
+    parts = ["claude", "-p", shlex.quote(query),
+             "--output-format", "text",
+             "--dangerously-skip-permissions"]
+    parts.extend(shlex.quote(a) for a in extra)
+    claude_cmd = " ".join(parts)
+    pipeline = f"{prog} prompt context | {claude_cmd} | {prog} prompt accept"
+
+    clipboard_ok, clipboard_err = False, ""
+    try:
+        subprocess.run(["pbcopy"], input=pipeline, text=True, check=True, timeout=5)
+        clipboard_ok = True
+    except FileNotFoundError:
+        clipboard_err = "pbcopy not found"
+    except (subprocess.SubprocessError, OSError) as exc:
+        clipboard_err = str(exc)
+
+    color = supports_color(sys.stdout)
+    bold = "\033[1m" if color else ""
+    green = "\033[32m" if color else ""
+    yellow = "\033[33m" if color else ""
+    dim = "\033[2m" if color else ""
+    reset = "\033[0m" if color else ""
+    rule = f"{dim}{'-' * 40}{reset}\n"
+
+    sys.stdout.write(rule)
+    sys.stdout.write(f"{green}{pipeline}{reset}\n")
+    sys.stdout.write(rule)
+    if clipboard_ok:
+        sys.stdout.write(f"{bold}copied to clipboard.{reset} paste in your terminal to run.\n")
+    else:
+        sys.stdout.write(f"{yellow}clipboard copy failed: {clipboard_err}.{reset} paste manually.\n")
+    sys.stdout.flush()
+    return EXIT_OK
+
+
+PROMPT_HANDLERS: dict[str, Callable[[str, list[str]], int]] = {
+    "context": cmd_prompt_context,
+    "accept": cmd_prompt_accept,
+    "claude": cmd_prompt_claude,
+}
+
+
+def cmd_prompt(prog: str, argv: list[str]) -> int:
+    """Dispatch the `prompt` sub-namespace (context, accept)."""
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print_prompt_help(prog)
+        return EXIT_OK
+    sub, sub_args = argv[0], argv[1:]
+    handler = PROMPT_HANDLERS.get(sub)
+    if handler is None:
+        sys.stderr.write(f"termctl: unknown prompt subcommand '{sub}'\n")
+        return EXIT_USAGE
+    return handler(prog, sub_args)
+
+
+HANDLERS: dict[str, Callable[[str, list[str]], int]] = {"exec": cmd_exec, "prompt": cmd_prompt}
+
+
+def print_top_help(prog: str) -> None:
+    """Print the top-level help message."""
+    sys.stdout.write(
+        f"usage: {prog} [exec | prompt] [options] -- cmd1 -- cmd2 [-- cmd3 ...]\n\n"
+        f"Subcommands:\n"
+        f"  exec    split the current iTerm2 tab and run a command in each pane (default)\n"
+        f"  prompt  manage the agent prompt template (context | accept)\n\n"
+        f"Run '{prog} exec --help' or '{prog} prompt --help' for full options.\n"
+    )
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """Top-level dispatcher: infer 'exec' when argv[1] is not a known subcommand."""
+    argv = list(sys.argv if argv is None else argv)
+    prog = Path(argv[0]).name if argv else "termctl"
+    rest = argv[1:]
+    if not rest or rest[0] in ("-h", "--help"):
+        print_top_help(prog)
+        return EXIT_OK
+    sub, sub_args = (rest[0], rest[1:]) if rest[0] in KNOWN_SUBCOMMANDS else ("exec", rest)
+    handler = HANDLERS.get(sub)
+    if handler is None:
+        sys.stderr.write(f"termctl: unknown subcommand '{sub}'\n")
+        return EXIT_USAGE
+    return handler(prog, sub_args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

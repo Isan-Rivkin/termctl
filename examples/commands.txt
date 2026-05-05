@@ -1,0 +1,7 @@
+# Sample commands file for `termctl --file`.
+# Blank lines and lines starting with `#` are skipped.
+# Each remaining line becomes one pane.
+
+tail -f /var/log/system.log
+top
+htop
