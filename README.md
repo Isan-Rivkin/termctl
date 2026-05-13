@@ -1,5 +1,7 @@
 # termctl
 
+![demo](demo1.gif)
+
 Wrap iTerm2's Python API to split the current tab into N panes and run a command in each.
 
 ## Prerequisites
