@@ -1,5 +1,7 @@
 # termctl
 
+Split iTerm2 into N panes and run a command in each
+
 ![demo](demo1.gif)
 
 Wrap iTerm2's Python API to split the current tab into N panes and run a command in each.
@@ -140,10 +142,6 @@ For `--file`:
 - shell quoting works: `tail -f "/var/log/my app.log"`
 - lookup order: the path you pass first, then `~/.termctl/presets/<basename>` as fallback. The presets dir is auto-created on first lookup.
 
-### Per-pane titles
-
-Each pane's title is set to the command it runs, so you can tell `stern -n prod api` apart from `stern -n prod worker` at a glance instead of seeing identical "stern" labels.
-
 ## Exit codes
 
 | Code | Meaning |
@@ -156,11 +154,8 @@ Each pane's title is set to the command it runs, so you can tell `stern -n prod 
 
 ## Limitations
 
-- `async_send_text` types into whatever the pane is currently doing. There is no shell-prompt awareness; if your shell is slow to start, the typed command may be lost. Run termctl on already-open shells.
-- iTerm2 enforces a minimum pane size. Splitting more panes than the window can hold will fail with a pane-split error (exit 4).
 - macOS + iTerm2 only. There is no fallback for Terminal.app, tmux, or other terminals.
 - The default delimiter `--` collides with command flags. If a command needs a literal `--`, set a different separator with `--delimiter`.
-- termctl logs only its own diagnostics. The panes' command output stays in the panes; capturing it requires a different approach (e.g. piping through `tee` inside each command).
 
 ## Troubleshooting
 
