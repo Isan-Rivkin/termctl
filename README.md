@@ -1,6 +1,6 @@
 # termctl
 
-Split iTerm2 into N panes and run a command in each
+**Split iTerm2 into N panes and run a command in each**
 
 ![demo](demo1.gif)
 
