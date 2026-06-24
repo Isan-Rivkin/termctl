@@ -19,6 +19,14 @@ Wrap iTerm2's Python API to split the current tab into N panes and run a command
 
 The script uses [PEP 723](https://peps.python.org/pep-0723/) inline metadata, so `uv` resolves and caches the `iterm2` dependency on first run; nothing else to install.
 
+### Homebrew (recommended for users)
+
+```bash
+brew install isan-rivkin/toolbox/termctl
+```
+
+This pulls `uv` automatically; `iterm2` is still fetched by `uv` on first run. Upgrade with `brew upgrade termctl`.
+
 ### Recommended: symlink into `~/bin` (development-friendly)
 
 A symlink keeps the installed command pointed at your working copy, so edits in the repo are picked up immediately without a reinstall step.
@@ -214,6 +222,21 @@ termctl --file llm_5:5:2026_14:00.txt   # resolves via the presets fallback
 ```
 
 The agent only sees the file `~/.termctl/prompt.md`; nothing else about termctl leaks. Customize that file to add environment-specific context (cluster names, namespaces, common commands).
+
+## Releasing (maintainer)
+
+Releases publish automatically to the [homebrew-toolbox](https://github.com/Isan-Rivkin/homebrew-toolbox) tap. To cut a new version:
+
+```bash
+gh release create vX.Y.Z -R Isan-Rivkin/termctl --generate-notes
+```
+
+That triggers the `release-brew` workflow, which computes the source-tarball sha256 and pushes an updated `termctl.rb` to the tap. Users then get it via `brew upgrade termctl`.
+
+How it works:
+- Workflow: `.github/workflows/release-brew.yml` (fires on published release; also `workflow_dispatch` with a `tag` input).
+- Auth: the workflow pushes to the tap using an SSH **deploy key** (write-scoped to the tap repo only), stored as the `TAP_DEPLOY_KEY` secret in this repo. The matching public key is the `termctl-release` deploy key on the tap.
+- No PAT required. To rotate: delete the `termctl-release` deploy key on the tap and the `TAP_DEPLOY_KEY` secret here, generate a new ed25519 keypair, re-add the public key as a write deploy key, and store the private key as `TAP_DEPLOY_KEY`.
 
 ## License
 
