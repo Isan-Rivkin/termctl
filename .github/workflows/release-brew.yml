@@ -1,0 +1,48 @@
+name: release-brew
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.0)"
+        required: true
+
+jobs:
+  bump-formula:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute version + sha256
+        id: meta
+        run: |
+          TAG="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          VERSION="${TAG#v}"
+          URL="https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
+          SHA=$(curl -fsSL "$URL" | shasum -a 256 | cut -d' ' -f1)
+          if [ -z "$SHA" ]; then echo "failed to compute sha256 for $URL"; exit 1; fi
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "sha=$SHA"
+            echo "url=$URL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update tap formula
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/Isan-Rivkin/homebrew-toolbox.git" tap
+          cd tap
+          sed -i -E \
+            -e "s#^  url .*#  url \"${{ steps.meta.outputs.url }}\"#" \
+            -e "s#^  sha256 .*#  sha256 \"${{ steps.meta.outputs.sha }}\"#" \
+            -e "s#^  version .*#  version \"${{ steps.meta.outputs.version }}\"#" \
+            termctl.rb
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "termctl.rb already up to date"; exit 0
+          fi
+          git commit -am "termctl ${{ steps.meta.outputs.version }}"
+          git push origin main
